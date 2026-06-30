@@ -25,19 +25,22 @@ class GapDetector:
         print(f"✓ GapDetector verbunden mit {db_path}")
 
     def _gap_eintragen(self, gap_type, severity, affected_entity,
-                       affected_id, description, recommended_action):
+                       affected_id, description, recommended_action,
+                       gap_subtype=None):
         """
         Interne Hilfsmethode — schreibt einen Gap-Eintrag
         in die metadata_gaps Tabelle.
         Wird von jeder Regel aufgerufen.
+        gap_subtype ist optional — Regeln ohne Subtyp übergeben nichts.
         """
         self.cursor.execute("""
             INSERT INTO metadata_gaps
-            (gap_type, severity, affected_entity, affected_id,
+            (gap_type, gap_subtype, severity, affected_entity, affected_id,
              description, recommended_action, status, created_at)
-            VALUES (?,?,?,?,?,?,?,?)
+            VALUES (?,?,?,?,?,?,?,?,?)
         """, (
             gap_type,
+            gap_subtype,
             severity,
             affected_entity,
             affected_id,
@@ -142,6 +145,57 @@ class GapDetector:
         print(f"✓ Regel 2 ausgeführt — {len(systeme)} Gaps gefunden")
         return systeme
 
+    def check_unleserliche_materialbeschreibung(self):
+        """
+        Regel 3: Technische Felder mit unleserlicher oder fehlender
+        Materialbeschreibung. Blockiert massenbasierte Emissionsberechnung.
+        Severity: high fix für 'unlesbar' und 'fehlend'.
+        'teilweise_lesbar' wird bewusst nicht erfasst — eigene Regel.
+        """
+        query = """
+            SELECT
+                tf.id,
+                tf.field_name,
+                tf.field_description,
+                tf.material_description_quality,
+                d.name      AS dataset_name,
+                ss.subsidiary,
+                ss.country
+            FROM technical_fields tf
+            JOIN datasets d         ON tf.dataset_id = d.id
+            JOIN source_systems ss  ON d.source_system_id = ss.id
+            WHERE tf.material_description_quality IN ('unlesbar', 'fehlend')
+        """
+        felder = pd.read_sql_query(query, self.conn)
+
+        for _, feld in felder.iterrows():
+            ursache = (
+                "nicht dokumentiert" if feld["material_description_quality"] == "fehlend"
+                else "nicht interpretierbar (lokale Sprache oder kryptischer Code)"
+            )
+            self._gap_eintragen(
+                gap_type         = "unleserliche_materialbeschreibung",
+                gap_subtype      = feld["material_description_quality"],
+                severity         = "high",
+                affected_entity  = "technical_fields",
+                affected_id      = feld["id"],
+                description      = (
+                    f"Feld '{feld['field_name']}' in Dataset '{feld['dataset_name']}' "
+                    f"({feld['subsidiary']}, {feld['country']}): "
+                    f"Materialbeschreibung ist {ursache}. "
+                    f"Massenbasierte Emissionsberechnung blockiert."
+                ),
+                recommended_action = (
+                    "Materialbeschreibung ins Deutsche oder Englische übersetzen "
+                    "bzw. Mapping-Tabelle (Lokalcode → Materialgruppe) erstellen "
+                    "und im Katalog verlinken."
+                )
+            )
+
+        self.conn.commit()
+        print(f"✓ Regel 3 ausgeführt — {len(felder)} Gaps gefunden")
+        return felder
+
     def run_all(self):
         """
         Führt alle Regeln in einem Durchlauf aus.
@@ -150,6 +204,7 @@ class GapDetector:
         self.gaps_leeren()
         self.check_fehlender_field_owner()
         self.check_systemanschluss()
+        self.check_unleserliche_materialbeschreibung()
 
         gesamt = pd.read_sql_query(
             "SELECT COUNT(*) AS anzahl FROM metadata_gaps", self.conn
