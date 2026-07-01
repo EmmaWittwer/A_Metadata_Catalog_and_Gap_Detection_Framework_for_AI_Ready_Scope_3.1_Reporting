@@ -196,6 +196,174 @@ class GapDetector:
         print(f"✓ Regel 3 ausgeführt — {len(felder)} Gaps gefunden")
         return felder
 
+    def check_fehlendes_field_mapping(self):
+        """
+        Regel 4: Anforderungen ohne Verknüpfung zu einem technischen Feld.
+        Bricht die Beziehungskette Requirement → Technical Field.
+        Severity: dynamisch nach tier_level (GHG Protocol Hierarchie).
+        """
+        query = """
+            SELECT
+                r.id,
+                r.name,
+                r.source,
+                r.tier_level,
+                r.priority,
+                r.coverage_status,
+                bt.name AS business_term_name
+            FROM requirements r
+            LEFT JOIN business_terms bt ON r.business_term_id = bt.id
+            WHERE r.technical_field_id IS NULL
+        """
+        anforderungen = pd.read_sql_query(query, self.conn)
+
+        severity_map = {1: "high", 2: "medium", 3: "low"}
+
+        for _, req in anforderungen.iterrows():
+            severity = severity_map.get(int(req["tier_level"]), "medium")
+            self._gap_eintragen(
+                gap_type         = "fehlendes_field_mapping",
+                severity         = severity,
+                affected_entity  = "requirements",
+                affected_id      = req["id"],
+                description      = (
+                    f"Anforderung '{req['name']}' ({req['source']}, "
+                    f"Tier {int(req['tier_level'])}) ist keinem technischen "
+                    f"Feld zugeordnet. Beziehungskette zum Datenpunkt fehlt."
+                ),
+                recommended_action = (
+                    "Passendes technisches Feld im Katalog identifizieren "
+                    "und technical_field_id in requirements eintragen."
+                )
+            )
+
+        self.conn.commit()
+        print(f"✓ Regel 4 ausgeführt — {len(anforderungen)} Gaps gefunden")
+        return anforderungen
+
+    def check_manuelle_daten_ohne_beleg(self):
+        """
+        Regel 5: Datasets mit manueller Dateneingabe ohne Belegnachweis.
+        Severity: dynamisch nach manual_entry_count.
+        'unbekannt' wird wie 'False' behandelt — auditrechtlich gleich kritisch.
+        """
+        query = """
+            SELECT
+                d.id,
+                d.name,
+                d.data_entry_type,
+                d.evidence_available,
+                d.manual_entry_count,
+                d.data_contact,
+                d.data_contact_role,
+                ss.subsidiary,
+                ss.country
+            FROM datasets d
+            JOIN source_systems ss ON d.source_system_id = ss.id
+            WHERE d.data_entry_type IN ('manuell', 'semi-manuell')
+            AND   d.evidence_available IN ('False', 'unbekannt')
+            AND   d.manual_entry_count > 0
+        """
+        datasets = pd.read_sql_query(query, self.conn)
+
+        for _, ds in datasets.iterrows():
+            count = int(ds["manual_entry_count"])
+            if count <= 10:
+                severity = "low"
+            elif count <= 50:
+                severity = "medium"
+            else:
+                severity = "high"
+
+            self._gap_eintragen(
+                gap_type         = "manuelle_daten_ohne_beleg",
+                gap_subtype      = ds["evidence_available"],
+                severity         = severity,
+                affected_entity  = "datasets",
+                affected_id      = ds["id"],
+                description      = (
+                    f"Dataset '{ds['name']}' ({ds['subsidiary']}, {ds['country']}) "
+                    f"hat {count} manuelle Einträge "
+                    f"({'kein Beleg vorhanden' if ds['evidence_available'] == 'False' else 'Belegstatus unbekannt'}). "
+                    f"Eintragstyp: {ds['data_entry_type']}."
+                ),
+                recommended_action = (
+                    "Belegnachweise (Rechnung, Lieferschein o.ä.) sammeln "
+                    "und evidence_type im Katalog dokumentieren. "
+                    "Bei Shadow-Daten: formalen Erfassungsprozess etablieren."
+                )
+            )
+
+        self.conn.commit()
+        print(f"✓ Regel 5 ausgeführt — {len(datasets)} Gaps gefunden")
+        return datasets
+
+    def check_automatisierungspotenzial(self):
+        """
+        Regel 6: Datasets mit manuellem Aufwand und Automatisierungspotenzial.
+        Schätzt Kosten aus manual_entry_count × Zeitaufwand × Stundensatz.
+        Severity: dynamisch nach geschätzten Kosten (<500 low, 500-1500 medium, >1500 high).
+        """
+        ZEITAUFWAND = {"manuell": 0.5, "semi-manuell": 0.25}
+        STUNDENSATZ = {
+            "Controlling": 85,
+            "GL-Assistenz": 55,
+            "IT": 90,
+            "unbekannt": 70,
+        }
+
+        query = """
+            SELECT
+                d.id,
+                d.name,
+                d.data_entry_type,
+                d.data_contact_role,
+                d.manual_entry_count,
+                ss.subsidiary,
+                ss.country
+            FROM datasets d
+            JOIN source_systems ss ON d.source_system_id = ss.id
+            WHERE d.data_entry_type IN ('manuell', 'semi-manuell')
+            AND   d.manual_entry_count > 0
+        """
+        datasets = pd.read_sql_query(query, self.conn)
+
+        for _, ds in datasets.iterrows():
+            rolle = ds["data_contact_role"] or "unbekannt"
+            stundensatz = STUNDENSATZ.get(rolle, STUNDENSATZ["unbekannt"])
+            zeitaufwand = ZEITAUFWAND[ds["data_entry_type"]]
+            kosten = round(int(ds["manual_entry_count"]) * zeitaufwand * stundensatz, 2)
+
+            if kosten < 500:
+                severity = "low"
+            elif kosten <= 1500:
+                severity = "medium"
+            else:
+                severity = "high"
+
+            self._gap_eintragen(
+                gap_type         = "automatisierungspotenzial",
+                gap_subtype      = ds["data_entry_type"],
+                severity         = severity,
+                affected_entity  = "datasets",
+                affected_id      = ds["id"],
+                description      = (
+                    f"Dataset '{ds['name']}' ({ds['subsidiary']}, {ds['country']}): "
+                    f"{int(ds['manual_entry_count'])} manuelle Einträge × "
+                    f"{zeitaufwand}h × {stundensatz}€/h = "
+                    f"ca. {kosten:.0f}€ geschätzter manueller Aufwand. "
+                    f"Eintragstyp: {ds['data_entry_type']}."
+                ),
+                recommended_action = (
+                    "Automatisierung oder API-Anbindung evaluieren. "
+                    "Kosten-Nutzen-Analyse auf Basis geschätztem Aufwand durchführen."
+                )
+            )
+
+        self.conn.commit()
+        print(f"✓ Regel 6 ausgeführt — {len(datasets)} Gaps gefunden")
+        return datasets
+
     def run_all(self):
         """
         Führt alle Regeln in einem Durchlauf aus.
@@ -205,6 +373,9 @@ class GapDetector:
         self.check_fehlender_field_owner()
         self.check_systemanschluss()
         self.check_unleserliche_materialbeschreibung()
+        self.check_fehlendes_field_mapping()
+        self.check_manuelle_daten_ohne_beleg()
+        self.check_automatisierungspotenzial()
 
         gesamt = pd.read_sql_query(
             "SELECT COUNT(*) AS anzahl FROM metadata_gaps", self.conn
