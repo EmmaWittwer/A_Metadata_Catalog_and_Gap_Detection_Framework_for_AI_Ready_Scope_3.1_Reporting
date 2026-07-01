@@ -90,3 +90,50 @@ class QueryEngine:
             "SELECT DISTINCT affected_entity FROM metadata_gaps ORDER BY affected_entity",
             self.conn
         )["affected_entity"].tolist()
+
+    def coverage_daten(self):
+        """
+        Gibt Coverage-Verteilung als DataFrame zurück — Basis für Donut-Chart.
+        Berechnet dynamisch aus der Beziehungskette.
+        """
+        df = pd.read_sql_query("""
+            SELECT
+                CASE
+                    WHEN r.business_term_id   IS NOT NULL
+                     AND r.technical_field_id IS NOT NULL
+                     AND tf.field_owner       IS NOT NULL
+                    THEN 'vollständig'
+                    WHEN r.business_term_id IS NULL
+                     AND r.technical_field_id IS NULL
+                    THEN 'offen'
+                    ELSE 'partiell'
+                END AS coverage
+            FROM requirements r
+            LEFT JOIN technical_fields tf ON r.technical_field_id = tf.id
+        """, self.conn)
+
+        counts = df["coverage"].value_counts().reset_index()
+        counts.columns = ["coverage", "anzahl"]
+        reihenfolge = {"vollständig": 0, "partiell": 1, "offen": 2}
+        counts["sort"] = counts["coverage"].map(reihenfolge)
+        return counts.sort_values("sort").drop(columns="sort").reset_index(drop=True)
+
+    def gap_uebersicht(self):
+        """
+        Gibt Gap-Anzahl nach gap_type und severity zurück — Basis für Balkendiagramm.
+        Severity wird als sortierbare Spalte mit zurückgegeben.
+        """
+        return pd.read_sql_query("""
+            SELECT
+                gap_type,
+                severity,
+                COUNT(*) AS anzahl,
+                CASE severity
+                    WHEN 'high'   THEN 1
+                    WHEN 'medium' THEN 2
+                    ELSE 3
+                END AS severity_sort
+            FROM metadata_gaps
+            GROUP BY gap_type, severity
+            ORDER BY gap_type, severity_sort
+        """, self.conn)
