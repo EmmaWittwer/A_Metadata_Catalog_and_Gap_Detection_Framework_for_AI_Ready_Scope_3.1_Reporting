@@ -364,6 +364,60 @@ class GapDetector:
         print(f"✓ Regel 6 ausgeführt — {len(datasets)} Gaps gefunden")
         return datasets
 
+    def coverage_score(self):
+        """
+        Berechnet den Coverage-Score dynamisch aus der Beziehungskette.
+        vollständig: business_term_id + technical_field_id + field_owner gesetzt.
+        partiell:    mindestens eines davon gesetzt, aber nicht alle.
+        offen:       weder business_term_id noch technical_field_id gesetzt.
+        """
+        query = """
+            SELECT
+                r.id,
+                r.name,
+                r.tier_level,
+                r.priority,
+                r.source,
+                CASE
+                    WHEN r.business_term_id  IS NOT NULL
+                     AND r.technical_field_id IS NOT NULL
+                     AND tf.field_owner        IS NOT NULL
+                    THEN 'vollständig'
+                    WHEN r.business_term_id IS NULL
+                     AND r.technical_field_id IS NULL
+                    THEN 'offen'
+                    ELSE 'partiell'
+                END AS coverage_dynamisch
+            FROM requirements r
+            LEFT JOIN technical_fields tf ON r.technical_field_id = tf.id
+        """
+        df = pd.read_sql_query(query, self.conn)
+
+        gesamt       = len(df)
+        vollstaendig = (df["coverage_dynamisch"] == "vollständig").sum()
+        partiell     = (df["coverage_dynamisch"] == "partiell").sum()
+        offen        = (df["coverage_dynamisch"] == "offen").sum()
+        score        = round(vollstaendig / gesamt * 100, 1)
+
+        print(f"\n{'='*45}")
+        print(f"  COVERAGE SCORE: {score}%")
+        print(f"{'='*45}")
+        print(f"  vollständig : {vollstaendig:2d} / {gesamt}  ({vollstaendig/gesamt*100:.1f}%)")
+        print(f"  partiell    : {partiell:2d} / {gesamt}  ({partiell/gesamt*100:.1f}%)")
+        print(f"  offen       : {offen:2d} / {gesamt}  ({offen/gesamt*100:.1f}%)")
+        print(f"{'='*45}\n")
+
+        print("Details nach Tier:")
+        tier_summary = (
+            df.groupby(["tier_level", "coverage_dynamisch"])
+            .size()
+            .unstack(fill_value=0)
+        )
+        print(tier_summary.to_string())
+        print()
+
+        return df
+
     def run_all(self):
         """
         Führt alle Regeln in einem Durchlauf aus.
